@@ -25,8 +25,8 @@ jobs:
 
       - name: Restore
         run: |
-          dotnet restore Larik.Data.MongoDB.csproj -r win-x64
-          dotnet restore tests/Larik.Data.MongoDB.Tests/Larik.Data.MongoDB.Tests.csproj -r win-x64
+          dotnet restore Larik.Data.MongoDB.csproj
+          dotnet restore tests/Larik.Data.MongoDB.Tests/Larik.Data.MongoDB.Tests.csproj
 
       - name: Test
         run: dotnet test tests/Larik.Data.MongoDB.Tests/Larik.Data.MongoDB.Tests.csproj -c Release --no-restore

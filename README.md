@@ -10,7 +10,7 @@ reference, so it can be released independently of the app.
 ## Build and test
 
 ```powershell
-dotnet restore -r win-x64
+dotnet restore
 dotnet test tests\Larik.Data.MongoDB.Tests\Larik.Data.MongoDB.Tests.csproj
 ```
 
@@ -19,7 +19,7 @@ The integration test is a no-op unless a `mongod` answers on `localhost:27017`.
 ## Package
 
 ```powershell
-dotnet restore -r win-x64
+dotnet restore
 pwsh ./scripts/package.ps1 -Version 1.0.0 -Rid win-x64
 ```
 
