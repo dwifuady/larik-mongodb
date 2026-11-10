@@ -1,0 +1,11 @@
+{
+  "manifestVersion": 1,
+  "id": "larik.mongodb",
+  "version": "1.0.0",
+  "publisher": "Larik",
+  "contract": ">=1.0 <2.0",
+  "providerIds": ["mongodb"],
+  "entryAssembly": "Larik.Data.MongoDB.dll",
+  "platforms": ["win-x64", "win-arm64"],
+  "license": "MIT"
+}

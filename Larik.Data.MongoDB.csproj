@@ -4,14 +4,20 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <Version>1.0.0</Version>
+    <AssemblyName>Larik.Data.MongoDB</AssemblyName>
+    <RootNamespace>Larik.Data.MongoDB</RootNamespace>
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Larik.Data" Version="1.0.0" />
     <PackageReference Include="MongoDB.Driver" Version="3.13.0" />
   </ItemGroup>
 
+  <!-- The test project lives under tests/; do not compile its sources into the provider. -->
   <ItemGroup>
-    <ProjectReference Include="..\Larik.Data\Larik.Data.csproj" />
+    <Compile Remove="tests\**\*.cs" />
   </ItemGroup>
 
 </Project>
