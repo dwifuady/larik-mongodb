@@ -7,6 +7,21 @@ commands and passes a small `db.collection.method(...)` mongosh subset through t
 This repository is the add-on's home. It consumes the `Larik.Data` contract package, not a project
 reference, so it can be released independently of the app.
 
+## Connect
+
+**Atlas / `mongodb+srv`**: paste the URI the cluster gives you into **Connection string** and connect.
+The field is declared as a password, so the app keeps it in Windows Credential Manager rather than the
+workspace file, and the provider builds the client with `MongoClientSettings.FromUrl` — SRV discovery,
+TLS, `authSource`, `replicaSet` and `retryWrites` all come from the URI. A URI wins over the discrete
+host/port fields; User and Password still apply when the URI has no user info.
+
+**Direct `mongod`**: leave the connection string empty and use Host (`db.example.com` or
+`db.example.com:27017`, the inline port wins over Port), Database, User and Password. The Auth source,
+Port, Direct connection and timeouts sit under Advanced.
+
+A private-link cluster (SRV targets are `vpce-…amazonaws.com` names resolving to `172.16.0.0/12`
+addresses) only answers from inside the VPC/VPN; a timeout there is the network, not the driver.
+
 ## Build and test
 
 ```powershell

@@ -6,6 +6,7 @@ using MongoDB.Bson;
 using MongoDB.Bson.IO;
 using MongoDB.Bson.Serialization;
 using MongoDB.Driver;
+using MongoDB.Driver.Core.Configuration;
 
 namespace Larik.Data.MongoDB;
 
@@ -28,6 +29,20 @@ public sealed class MongoProvider : IDatabaseProvider
 
     public string? DescribeEndpoint(ConnectionProfile profile)
     {
+        if (TryParseConnectionString(profile.Get("connectionString")) is { } url)
+        {
+            var seed = url.Servers.FirstOrDefault();
+            if (seed is null)
+            {
+                return null;
+            }
+
+            // An SRV seed reports the DNS port (53); showing "host:53" would only mislead.
+            return url.Scheme == ConnectionStringScheme.MongoDBPlusSrv
+                ? $"MongoDB · {seed.Host}"
+                : $"MongoDB · {seed.Host}:{seed.Port}";
+        }
+
         var host = profile.Get("host");
         if (string.IsNullOrWhiteSpace(host))
         {
@@ -35,21 +50,58 @@ public sealed class MongoProvider : IDatabaseProvider
         }
 
         var port = profile.GetInt("port", 27017);
-        return $"MongoDB · {host}:{port}";
+        return $"MongoDB · {host.Trim()}:{port}";
     }
 
-    public string? DescribeIdentity(ConnectionProfile profile) =>
-        string.IsNullOrWhiteSpace(profile.Get("user")) ? null : profile.Get("user")!.Trim();
+    public string? DescribeIdentity(ConnectionProfile profile)
+    {
+        if (TryParseConnectionString(profile.Get("connectionString")) is { } url
+            && !string.IsNullOrWhiteSpace(url.Username))
+        {
+            return url.Username.Trim();
+        }
+
+        return string.IsNullOrWhiteSpace(profile.Get("user")) ? null : profile.Get("user")!.Trim();
+    }
+
+    /// <summary>
+    /// Parses a pasted URI for labels, or returns null when there is none or it is still incomplete. It
+    /// never throws: the connection dialog calls this while the user is typing.
+    /// </summary>
+    private static MongoUrl? TryParseConnectionString(string? connectionString)
+    {
+        if (string.IsNullOrWhiteSpace(connectionString))
+        {
+            return null;
+        }
+
+        try
+        {
+            return new MongoUrl(connectionString.Trim());
+        }
+        catch
+        {
+            return null;
+        }
+    }
 
     public IReadOnlyList<ProviderSetting> Settings { get; } =
     [
         new()
         {
+            Key = "connectionString",
+            Label = "Connection string",
+            Kind = ProviderSettingKind.Password,
+            Placeholder = "mongodb+srv://user:password@cluster/database",
+            Hint = "Paste the URI your cluster gives you — it carries SRV discovery, TLS and the replica set. When set it replaces host and port; User and Password still fill in when the URI omits them. It is kept in Windows Credential Manager, not the workspace file.",
+        },
+        new()
+        {
             Key = "host",
             Label = "Host",
-            Required = true,
             DefaultValue = "localhost",
-            Placeholder = "localhost or a host name",
+            Placeholder = "db.example.com, or db.example.com:27018",
+            Hint = "Ignored when a connection string is set. host:port overrides Port.",
         },
         new()
         {
@@ -113,7 +165,10 @@ public sealed class MongoProvider : IDatabaseProvider
 internal sealed class MongoConnection : IDatabaseConnection
 {
     private readonly ConnectionProfile _profile;
-    private readonly string _profileDatabase;
+
+    // The database the profile names explicitly; null when the starting database should come from the
+    // connection string (or "admin" when it names none either).
+    private readonly string? _configuredDatabase;
 
     // Sampled field types per (database, collection), used to coerce string literals to UUID/ObjectId
     // binaries. Session-scoped: the schema is inferred, so it can go stale, and a reconnect starts fresh.
@@ -125,8 +180,8 @@ internal sealed class MongoConnection : IDatabaseConnection
     public MongoConnection(ConnectionProfile profile)
     {
         _profile = profile;
-        _profileDatabase = string.IsNullOrWhiteSpace(profile.Get("database")) ? "admin" : profile.Get("database")!.Trim();
-        _activeDatabase = _profileDatabase;
+        _configuredDatabase = string.IsNullOrWhiteSpace(profile.Get("database")) ? null : profile.Get("database")!.Trim();
+        _activeDatabase = _configuredDatabase ?? "admin";
     }
 
     public ConnectionState State { get; private set; } = ConnectionState.Disconnected;
@@ -135,7 +190,14 @@ internal sealed class MongoConnection : IDatabaseConnection
 
     public async Task OpenAsync(CancellationToken cancellationToken = default)
     {
-        var client = new MongoClient(BuildSettings());
+        var (settings, uriDatabase) = Build(_profile);
+        if (_configuredDatabase is null && !string.IsNullOrWhiteSpace(uriDatabase))
+        {
+            // The URI names the database to start in; an explicit Database field still wins.
+            _activeDatabase = uriDatabase;
+        }
+
+        var client = new MongoClient(settings);
         try
         {
             State = ConnectionState.Connecting;
@@ -187,36 +249,131 @@ internal sealed class MongoConnection : IDatabaseConnection
 
     public async ValueTask DisposeAsync() => await CloseAsync();
 
-    private MongoClientSettings BuildSettings()
+    /// <summary>
+    /// Turns a profile into client settings. A pasted connection string wins over the discrete fields:
+    /// it is the only way to express SRV discovery, TLS and replica-set routing, and an Atlas seed host
+    /// has SRV records only (no A record), so it cannot be dialled as a host:port. The returned database
+    /// is the one named by the URI, or null when the fields were used.
+    /// </summary>
+    internal static (MongoClientSettings Settings, string? Database) Build(ConnectionProfile profile)
     {
-        var host = _profile.Get("host");
-        if (string.IsNullOrWhiteSpace(host))
+        var connectionString = profile.Get("connectionString");
+        if (!string.IsNullOrWhiteSpace(connectionString))
         {
-            throw new InvalidOperationException("The MongoDB connection needs a host name.");
+            return BuildFromConnectionString(profile, connectionString.Trim());
         }
 
-        var port = _profile.GetInt("port", 27017);
+        var host = profile.Get("host");
+        if (string.IsNullOrWhiteSpace(host))
+        {
+            throw new InvalidOperationException(
+                "The MongoDB connection needs a host name or a mongodb:// / mongodb+srv:// connection string.");
+        }
+
+        // Host may be entered as host:port. The MongoServerAddress constructor rejects the colon, and its
+        // own failure ("is not a valid host") tells the user nothing about what to fix.
+        if (!MongoServerAddress.TryParse(host.Trim(), out var address))
+        {
+            var trimmed = host.Trim();
+            var looksLikeUri = trimmed.StartsWith("mongodb://", StringComparison.OrdinalIgnoreCase)
+                || trimmed.StartsWith("mongodb+srv://", StringComparison.OrdinalIgnoreCase);
+
+            // Never echo the value: a pasted URI carries the password and this message reaches the status bar.
+            throw new InvalidOperationException(looksLikeUri
+                ? "That is a connection URI, not a host name. Paste it into Connection string, or enter just the host name (db.example.com or db.example.com:27017)."
+                : "That is not a host name. Use db.example.com, db.example.com:27017, or paste the full connection string.");
+        }
+
+        if (!HasExplicitPort(host.Trim()))
+        {
+            // A bare host keeps the Port field; an inline port is explicit and wins over it.
+            var port = profile.GetInt("port", 27017);
+            address = new MongoServerAddress(address.Host, port is > 0 and <= 65535 ? port : 27017);
+        }
+
         var settings = new MongoClientSettings
         {
-            Server = new MongoServerAddress(host, port is > 0 and <= 65535 ? port : 27017),
-            DirectConnection = _profile.GetBool("directConnection", true),
-            ConnectTimeout = TimeSpan.FromSeconds(Math.Max(1, _profile.GetInt("connectTimeout", 10))),
-            ServerSelectionTimeout = TimeSpan.FromSeconds(Math.Max(1, _profile.GetInt("connectTimeout", 10))),
+            Server = address,
+            DirectConnection = profile.GetBool("directConnection", true),
+            ConnectTimeout = ConnectTimeout(profile),
+            ServerSelectionTimeout = ConnectTimeout(profile),
             ApplicationName = "Larik SQL Studio",
             MaxConnectionPoolSize = 1,
         };
 
-        var user = _profile.Get("user");
-        var password = _profile.Get("password");
+        var user = profile.Get("user");
+        var password = profile.Get("password");
         if (!string.IsNullOrWhiteSpace(user))
         {
             settings.Credential = MongoCredential.CreateCredential(
-                string.IsNullOrWhiteSpace(_profile.Get("authSource")) ? "admin" : _profile.Get("authSource")!.Trim(),
+                string.IsNullOrWhiteSpace(profile.Get("authSource")) ? "admin" : profile.Get("authSource")!.Trim(),
                 user.Trim(),
                 password ?? string.Empty);
         }
 
-        return settings;
+        return (settings, null);
+    }
+
+    private static (MongoClientSettings Settings, string? Database) BuildFromConnectionString(
+        ConnectionProfile profile,
+        string connectionString)
+    {
+        MongoUrl url;
+        try
+        {
+            url = new MongoUrl(connectionString);
+        }
+        catch (Exception ex) when (ex is ArgumentException or FormatException or MongoException)
+        {
+            throw new InvalidOperationException(
+                "The connection string is not a valid MongoDB URI. It must start with mongodb:// or mongodb+srv://.", ex);
+        }
+
+        // FromUrl refuses a URI that names a user but no password ("A DEFAULT credential must have a
+        // password"), so the credential is stripped before building and attached from the fields after.
+        var profilePassword = profile.Get("password");
+        var fillPassword = !string.IsNullOrWhiteSpace(url.Username)
+            && string.IsNullOrEmpty(url.Password)
+            && !string.IsNullOrEmpty(profilePassword);
+
+        // FromUrl owns everything the URI expresses (SRV, TLS, authSource, replicaSet, retryWrites); the
+        // add-on only applies the session identity and the timeout that keeps the dialog responsive.
+        var settings = fillPassword
+            ? MongoClientSettings.FromUrl(new MongoUrlBuilder(url.Url) { Username = null, Password = null }.ToMongoUrl())
+            : MongoClientSettings.FromUrl(url);
+
+        settings.ApplicationName = "Larik SQL Studio";
+        settings.MaxConnectionPoolSize = 1;
+        settings.ConnectTimeout = ConnectTimeout(profile);
+        settings.ServerSelectionTimeout = ConnectTimeout(profile);
+
+        if (fillPassword)
+        {
+            settings.Credential = MongoCredential.CreateCredential(
+                string.IsNullOrWhiteSpace(url.AuthenticationSource) ? "admin" : url.AuthenticationSource.Trim(),
+                url.Username.Trim(),
+                profilePassword!);
+        }
+        else if (string.IsNullOrWhiteSpace(url.Username) && !string.IsNullOrWhiteSpace(profile.Get("user")))
+        {
+            // A URI pasted without user info (docs, a redacted ticket) still accepts the discrete credential.
+            settings.Credential = MongoCredential.CreateCredential(
+                string.IsNullOrWhiteSpace(profile.Get("authSource")) ? "admin" : profile.Get("authSource")!.Trim(),
+                profile.Get("user")!.Trim(),
+                profilePassword ?? string.Empty);
+        }
+
+        return (settings, url.DatabaseName);
+    }
+
+    private static TimeSpan ConnectTimeout(ConnectionProfile profile) =>
+        TimeSpan.FromSeconds(Math.Max(1, profile.GetInt("connectTimeout", 10)));
+
+    /// <summary>True for <c>host:port</c> and <c>[ipv6]:port</c>; a bare host (or bare <c>[ipv6]</c>) is not.</summary>
+    private static bool HasExplicitPort(string host)
+    {
+        var bracket = host.IndexOf(']');
+        return bracket >= 0 ? host.IndexOf(':', bracket) > bracket : host.Contains(':');
     }
 
     private string ResolveDb(string? requested) =>
