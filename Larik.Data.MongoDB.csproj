@@ -5,7 +5,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
     <AssemblyName>Larik.Data.MongoDB</AssemblyName>
     <RootNamespace>Larik.Data.MongoDB</RootNamespace>
     <!-- One restore produces the assets for both release zips. -->
