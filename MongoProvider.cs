@@ -27,6 +27,13 @@ public sealed class MongoProvider : IDatabaseProvider
 
     public IEditorLanguage? EditorLanguage => MongoTSqlDialect.Instance;
 
+    /// <summary>
+    /// Lets an agent read through a saved connection exposed read-only without opening the door to
+    /// writes. Before this existed the host had to refuse every Mongo statement, because it cannot
+    /// tell a <c>find</c> from a <c>deleteMany</c> on its own.
+    /// </summary>
+    public IReadOnlyStatementPolicy? ReadOnlyPolicy => MongoReadOnlyPolicy.Instance;
+
     public string? DescribeEndpoint(ConnectionProfile profile)
     {
         if (TryParseConnectionString(profile.Get("connectionString")) is { } url)

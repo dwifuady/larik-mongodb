@@ -1,9 +1,9 @@
 {
   "manifestVersion": 1,
   "id": "larik.mongodb",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "publisher": "Larik",
-  "contract": ">=1.0 <2.0",
+  "contract": ">=1.2 <2.0",
   "providerIds": ["mongodb"],
   "entryAssembly": "Larik.Data.MongoDB.dll",
   "platforms": ["win-x64", "win-arm64"],

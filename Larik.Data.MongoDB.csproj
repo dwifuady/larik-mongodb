@@ -5,7 +5,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <AssemblyName>Larik.Data.MongoDB</AssemblyName>
     <RootNamespace>Larik.Data.MongoDB</RootNamespace>
     <!-- One restore produces the assets for both release zips. -->
@@ -13,7 +13,9 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Larik.Data" Version="1.0.0" />
+    <!-- 1.2.0 is the contract that carries IReadOnlyStatementPolicy; older packages cannot compile
+         the read gate. The host supplies the assembly at run time (see addon/larik-addon.json). -->
+    <PackageReference Include="Larik.Data" Version="1.2.0" />
     <PackageReference Include="MongoDB.Driver" Version="3.13.0" />
   </ItemGroup>
 

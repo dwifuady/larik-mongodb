@@ -31,6 +31,13 @@ dotnet test tests\Larik.Data.MongoDB.Tests\Larik.Data.MongoDB.Tests.csproj
 
 The integration test is a no-op unless a `mongod` answers on `localhost:27017`.
 
+`Larik.Data` 1.2.0 carries the contract the read gate implements. Until that package is on nuget.org,
+restore against the feed the app repository packs it into (or any folder containing the `.nupkg`):
+
+```powershell
+dotnet restore -s <local-feed> -s https://api.nuget.org/v3/index.json
+```
+
 ## Package
 
 ```powershell
@@ -49,9 +56,21 @@ Push a `v*` tag (for example `v1.0.0`). The workflow runs the tests, packages `w
 After the release, add its URL and SHA-256 to the
 [`larik-addons`](https://github.com/dwifuady/larik-addons) index.
 
+## Agent access (MCP)
+
+The provider implements `IReadOnlyStatementPolicy`, so a workspace exposed to an agent as **Read
+only** runs reads instead of refusing everything: a `SELECT` the translator compiles to a pipeline,
+a `USE`, or one mongosh call on the read allow-list (`find`, `findOne`, `aggregate`, `count`,
+`countDocuments`, `estimatedDocumentCount`, `distinct`, `getIndexes`, `getCollectionNames`, `stats`).
+
+The gate is fail-closed. `INSERT` / `UPDATE` / `DELETE`, `insertOne` / `updateMany` /
+`deleteMany`, `runCommand`, chained calls and any batch mixing a read with something else are
+refused, and `aggregate` is refused when it carries a writing stage (`$out`, `$merge`). Write
+workspaces still go through the studio's approval dialog as usual.
+
 ## Contract
 
-Built against `Larik.Data` 1.0.0 and declares `>=1.0 <2.0` in `addon/larik-addon.json`. The app
+Built against `Larik.Data` 1.2.0 and declares `>=1.2 <2.0` in `addon/larik-addon.json`. The app
 binds the contract to its own assembly, so the add-on must not ship `Larik.Data.dll`.
 
 The provider contract and the add-on format are documented in
