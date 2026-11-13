@@ -134,5 +134,67 @@ public sealed class MongoIntegrationTests
         Assert.False(shellFind[0].IsError);
         Assert.Contains("name", shellFind[0].Columns.Select(c => c.Name));
         Assert.Single(shellFind[0].Rows);
+
+        // A shell projection is applied instead of silently ignored.
+        var projected = await connection.ExecuteBatchAsync(
+            "db.seed.find({}, { \"name\": 1, \"_id\": 0 });",
+            Database, QueryExecutionOptions.Default);
+        Assert.False(projected[0].IsError);
+        Assert.Equal(["name"], projected[0].Columns.Select(c => c.Name));
+
+        // Cursor modifiers let a shell read ask for a specific slice.
+        var sliced = await connection.ExecuteBatchAsync(
+            "db.seed.find({}).sort({ \"name\": 1 }).limit(2);",
+            Database, QueryExecutionOptions.Default);
+        Assert.False(sliced[0].IsError);
+        Assert.Equal(2, sliced[0].Rows.Count);
+        var nameIndex = sliced[0].Columns.Select(c => c.Name).ToList().IndexOf("name");
+        Assert.Equal("alice", sliced[0].Rows[0][nameIndex]);
+
+        // The rest of the read allow-list is executable, not just gate-approved.
+        var estimated = await connection.ExecuteBatchAsync(
+            "db.seed.estimatedDocumentCount();",
+            Database, QueryExecutionOptions.Default);
+        Assert.False(estimated[0].IsError);
+        Assert.Equal("3", estimated[0].Rows[0][0]);
+
+        var distinct = await connection.ExecuteBatchAsync(
+            "db.seed.distinct(\"name\");",
+            Database, QueryExecutionOptions.Default);
+        Assert.False(distinct[0].IsError);
+        Assert.Equal(3, distinct[0].Rows.Count);
+
+        var indexes = await connection.ExecuteBatchAsync(
+            "db.seed.getIndexes();",
+            Database, QueryExecutionOptions.Default);
+        Assert.False(indexes[0].IsError);
+        Assert.NotEmpty(indexes[0].Rows);
+
+        var collections = await connection.ExecuteBatchAsync(
+            "db.getCollectionNames();",
+            Database, QueryExecutionOptions.Default);
+        Assert.False(collections[0].IsError);
+        Assert.Contains("seed", collections[0].Rows.Select(row => row[0]));
+
+        var databaseStats = await connection.ExecuteBatchAsync(
+            "db.stats();",
+            Database, QueryExecutionOptions.Default);
+        Assert.False(databaseStats[0].IsError);
+        Assert.Single(databaseStats[0].Rows);
+
+        var collectionStats = await connection.ExecuteBatchAsync(
+            "db.seed.stats();",
+            Database, QueryExecutionOptions.Default);
+        Assert.False(collectionStats[0].IsError);
+        Assert.Single(collectionStats[0].Rows);
+
+        // A shell find obeys the same row cap as SELECT, and reports the truncation.
+        var capped = await connection.ExecuteBatchAsync(
+            "db.seed.find({});",
+            Database, new QueryExecutionOptions { MaxRows = 1 });
+        Assert.False(capped[0].IsError);
+        Assert.True(capped[0].IsTruncated);
+        Assert.Single(capped[0].Rows);
+        Assert.Equal(1, capped[0].RowLimit);
     }
 }

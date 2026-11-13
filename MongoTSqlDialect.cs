@@ -52,8 +52,9 @@ public sealed class MongoTSqlDialect : SqlLanguage, ISqlDialect
     /// <summary>Methods the mongosh passthrough runner understands.</summary>
     private static readonly string[] ShellMethods =
     [
-        "find", "findOne", "count", "countDocuments", "insertOne", "insertMany",
-        "updateOne", "updateMany", "deleteOne", "deleteMany",
+        "find", "findOne", "count", "countDocuments", "estimatedDocumentCount", "distinct",
+        "getIndexes", "stats", "insertOne", "insertMany", "updateOne", "updateMany",
+        "deleteOne", "deleteMany",
     ];
 
     public static MongoTSqlDialect Instance { get; } = new();

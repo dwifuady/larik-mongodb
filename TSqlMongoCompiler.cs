@@ -1460,7 +1460,7 @@ internal static class TSqlMongoCompiler
 
             if (q.OrderBy.Count > 0)
             {
-                pipeline.Add(SortStage(scope, groupMap, q.OrderBy));
+                pipeline.Add(SortStage(scope, groupMap, q.OrderBy, q.Items));
             }
 
             if (q.Offset is { } skip)
@@ -1660,22 +1660,23 @@ internal static class TSqlMongoCompiler
             };
         }
 
-        private static BsonDocument SortStage(Scope scope, GroupMap? group, List<(X, bool)> orderBy)
+        private static BsonDocument SortStage(Scope scope, GroupMap? group, List<(X, bool)> orderBy, List<SelectItem> items)
         {
             var sort = new BsonDocument();
             foreach (var (oexpr, desc) in orderBy)
             {
+                var expr = ResolveAlias(oexpr, items);
                 string field;
                 if (group is not null)
                 {
-                    var gref = ExprCompiler.GroupRef(group, oexpr);
+                    var gref = ExprCompiler.GroupRef(group, expr);
                     if (gref is not null)
                     {
                         field = gref.StartsWith("$_id.")
                             ? "_id." + gref[5..]
                             : gref[1..];
                     }
-                    else if (oexpr is ColX)
+                    else if (expr is ColX)
                     {
                         throw new TranslationException("A column in ORDER BY must appear in GROUP BY or inside an aggregate.");
                     }
@@ -1686,7 +1687,7 @@ internal static class TSqlMongoCompiler
                 }
                 else
                 {
-                    if (oexpr is not ColX { Parts: var parts })
+                    if (expr is not ColX { Parts: var parts })
                     {
                         throw new TranslationException("ORDER BY outside a group must name a plain column.");
                     }
@@ -1698,6 +1699,31 @@ internal static class TSqlMongoCompiler
             }
 
             return new BsonDocument("$sort", sort);
+        }
+
+        /// <summary>
+        /// ORDER BY may name a SELECT alias rather than repeat the expression, as in <c>ORDER BY n</c>
+        /// for <c>COUNT(*) AS n</c>. A single-part column that matches an alias is replaced by the
+        /// expression it names before the group/aggregate check runs.
+        /// </summary>
+        private static X ResolveAlias(X expr, List<SelectItem> items)
+        {
+            if (expr is not ColX { Parts: [var name] })
+            {
+                return expr;
+            }
+
+            foreach (var item in items)
+            {
+                if (item.Value is not null
+                    && item.Alias is { } alias
+                    && string.Equals(alias, name, StringComparison.Ordinal))
+                {
+                    return item.Value;
+                }
+            }
+
+            return expr;
         }
 
         private static (BsonDocument? Project, IReadOnlyList<string>? Columns) Project(Scope scope, GroupMap? group, Query q, IReadOnlyDictionary<string, string>? fieldTypes)

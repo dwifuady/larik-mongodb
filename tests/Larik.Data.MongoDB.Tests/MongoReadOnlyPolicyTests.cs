@@ -18,14 +18,21 @@ public sealed class MongoReadOnlyPolicyTests
     [InlineData("USE [shop]")]
     [InlineData("-- the open orders\nSELECT * FROM [orders] WHERE [status] = 'open'")]
     [InlineData("db.users.find({})")]
+    [InlineData("db.users.find({}, { name: 1 })")]
+    [InlineData("db.users.find({}).sort({ age: -1 }).limit(5)")]
+    [InlineData("db.users.find({}).skip(10).limit(5)")]
+    [InlineData("db.users.find({}).project({ name: 1 })")]
+    [InlineData("SELECT [city], COUNT(*) AS [n] FROM [users] GROUP BY [city] ORDER BY [n] DESC")]
     [InlineData("db.users.findOne({ _id: 1 })")]
     [InlineData("db.users.find({ name: 'a;b' });")]
     [InlineData("db.orders.count({ status: 'open' })")]
-    [InlineData("db.orders.aggregate([{ $match: { status: 'open' } }, { $limit: 10 }])")]
+    [InlineData("db.orders.countDocuments({ status: 'open' })")]
+    [InlineData("db.orders.estimatedDocumentCount()")]
     [InlineData("db.users.distinct('city')")]
+    [InlineData("db.users.getIndexes()")]
+    [InlineData("db.users.stats()")]
     [InlineData("db.getCollectionNames()")]
     [InlineData("db.stats()")]
-    [InlineData("db.users.aggregate([{ $match: { note: '$out' } }])")]
     public void Reads_are_proven(string statement) => Assert.True(Policy.IsProvenRead(statement));
 
     [Theory]
@@ -39,14 +46,24 @@ public sealed class MongoReadOnlyPolicyTests
     [InlineData("db.users.deleteMany({})")]
     [InlineData("db.runCommand({ dropDatabase: 1 })")]
     [InlineData("db.getSiblingDB('admin').adminCommand({ shutdown: 1 })")]
-    // A read method carrying a writing stage is not a read, however it is spelled or nested.
+    // A read method is only valid at its own level.
+    [InlineData("db.getIndexes()")]
+    [InlineData("db.users.getCollectionNames()")]
+    [InlineData("db.find({})")]
+    // aggregate is refused outright: it can write through $out/$merge, and a text scan cannot prove
+    // a parsed pipeline is read-only (an escaped \u0024out is still $out to the parser).
+    [InlineData("db.orders.aggregate([{ $match: { status: 'open' } }, { $limit: 10 }])")]
     [InlineData("db.users.aggregate([{ $match: {} }, { $out: 'users' }])")]
     [InlineData("db.users.aggregate([{ $merge: { into: 'archive' } }])")]
     [InlineData("db.users.aggregate([{ \"$out\": \"users\" }])")]
+    [InlineData("db.users.aggregate([{ \"\\u0024out\": \"users\" }])")]
     [InlineData("db.users.aggregate([{ $facet: { a: [{ $out: 'x' }] } }])")]
     [InlineData("db.users.find({}, { $out: 1 })")]
-    // Chained calls are not one call the runner can execute, so they are not provably anything.
-    [InlineData("db.users.find({}).sort({ a: 1 })")]
+    // Only the cursor modifiers that narrow a find are chainable; a callback can write.
+    [InlineData("db.users.find({}).forEach(function (u) { db.users.deleteOne({ _id: u._id }); })")]
+    [InlineData("db.users.find({}).deleteMany({})")]
+    [InlineData("db.users.count({}).limit(5)")]
+    [InlineData("db.users.find({}).limit(-1)")]
     // One non-read unit poisons the batch, even when the first statement reads.
     [InlineData("SELECT * FROM [users]; db.users.deleteMany({})")]
     [InlineData("db.users.find({}); db.users.insertOne({ a: 1 })")]

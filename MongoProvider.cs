@@ -581,7 +581,7 @@ internal sealed class MongoConnection : IDatabaseConnection
             QueryResult result;
             if (span.Language == MongoScriptClassifier.Shell)
             {
-                result = await ExecuteShellAsync(statement, stopwatch, cancellationToken);
+                result = await ExecuteShellAsync(statement, options, stopwatch, cancellationToken);
             }
             else
             {
@@ -803,16 +803,26 @@ internal sealed class MongoConnection : IDatabaseConnection
     // ------------------------------------------------------------------ mongosh passthrough
 
     /// <summary>Runs a <c>db.collection.method(...)</c> statement as written, for the common methods.</summary>
-    private async Task<QueryResult> ExecuteShellAsync(string statement, Stopwatch stopwatch, CancellationToken cancellationToken)
+    private async Task<QueryResult> ExecuteShellAsync(
+        string statement,
+        QueryExecutionOptions options,
+        Stopwatch stopwatch,
+        CancellationToken cancellationToken)
     {
         try
         {
             var shell = MongoShellRunner.Parse(statement);
             return shell switch
             {
-                ShellFind f => await RunShellFind(f, stopwatch, cancellationToken),
+                ShellFind f => await RunShellFind(f, options, stopwatch, cancellationToken),
                 ShellFindOne f => await RunShellFindOne(f, stopwatch, cancellationToken),
                 ShellCount c => await RunShellCount(c, stopwatch, cancellationToken),
+                ShellEstimatedCount c => await RunShellEstimatedCount(c, stopwatch, cancellationToken),
+                ShellDistinct d => await RunShellDistinct(d, stopwatch, cancellationToken),
+                ShellGetIndexes i => await RunShellGetIndexes(i, stopwatch, cancellationToken),
+                ShellCollectionStats s => await RunShellCollectionStats(s, stopwatch, cancellationToken),
+                ShellDatabaseStats => await RunShellDatabaseStats(stopwatch, cancellationToken),
+                ShellGetCollectionNames => await RunShellGetCollectionNames(stopwatch, cancellationToken),
                 ShellInsertMany i => RunShellInsert(i, stopwatch, cancellationToken),
                 ShellUpdate u => await RunShellUpdate(u, stopwatch, cancellationToken),
                 ShellDeleteBatch d => await RunShellDelete(d, stopwatch, cancellationToken),
@@ -829,23 +839,33 @@ internal sealed class MongoConnection : IDatabaseConnection
         }
     }
 
-    private async Task<QueryResult> RunShellFind(ShellFind find, Stopwatch stopwatch, CancellationToken cancellationToken)
+    private async Task<QueryResult> RunShellFind(
+        ShellFind find,
+        QueryExecutionOptions options,
+        Stopwatch stopwatch,
+        CancellationToken cancellationToken)
     {
         var collection = Database().GetCollection<BsonDocument>(find.Collection);
-        var docs = await collection.Find(find.Filter).ToListAsync(cancellationToken);
-        return RowsResult(docs, stopwatch);
+        var rowCap = options.EffectiveMaxRows;
+
+        // Same cap as RunSelect, pushed to the server so a large collection is never materialised
+        // whole. The extra row is what tells us the result was truncated.
+        using var cursor = await collection.FindAsync(
+            find.Filter,
+            MongoShellRunner.BuildFindOptions(find, rowCap),
+            cancellationToken);
+        var docs = await cursor.ToListAsync(cancellationToken);
+        return RowsResult(docs, stopwatch, rowCap);
     }
 
     private async Task<QueryResult> RunShellFindOne(ShellFindOne find, Stopwatch stopwatch, CancellationToken cancellationToken)
     {
         var collection = Database().GetCollection<BsonDocument>(find.Collection);
-        var doc = await collection.Find(find.Filter).FirstOrDefaultAsync(cancellationToken);
-        var docs = new List<BsonDocument>();
-        if (doc is not null)
-        {
-            docs.Add(doc);
-        }
-
+        using var cursor = await collection.FindAsync(
+            find.Filter,
+            MongoShellRunner.BuildFindOneOptions(find),
+            cancellationToken);
+        var docs = await cursor.ToListAsync(cancellationToken);
         return RowsResult(docs, stopwatch);
     }
 
@@ -855,6 +875,59 @@ internal sealed class MongoConnection : IDatabaseConnection
         var value = await collection.CountDocumentsAsync(count.Filter, cancellationToken: cancellationToken);
         var doc = new BsonDocument("count", value);
         return RowsResult([doc], stopwatch);
+    }
+
+    private async Task<QueryResult> RunShellEstimatedCount(ShellEstimatedCount count, Stopwatch stopwatch, CancellationToken cancellationToken)
+    {
+        var collection = Database().GetCollection<BsonDocument>(count.Collection);
+        var value = await collection.EstimatedDocumentCountAsync(cancellationToken: cancellationToken);
+        return RowsResult([new BsonDocument("count", value)], stopwatch);
+    }
+
+    private async Task<QueryResult> RunShellDistinct(ShellDistinct distinct, Stopwatch stopwatch, CancellationToken cancellationToken)
+    {
+        var collection = Database().GetCollection<BsonDocument>(distinct.Collection);
+        using var cursor = await collection.DistinctAsync<BsonValue>(
+            new StringFieldDefinition<BsonDocument, BsonValue>(distinct.Field),
+            new BsonDocumentFilterDefinition<BsonDocument>(distinct.Filter),
+            options: null,
+            cancellationToken: cancellationToken);
+        var values = await cursor.ToListAsync(cancellationToken);
+        var docs = values.Select(value => new BsonDocument { { distinct.Field, value } }).ToList();
+        return RowsResult(docs, stopwatch, emptyColumns: [distinct.Field]);
+    }
+
+    private async Task<QueryResult> RunShellGetIndexes(ShellGetIndexes indexes, Stopwatch stopwatch, CancellationToken cancellationToken)
+    {
+        var collection = Database().GetCollection<BsonDocument>(indexes.Collection);
+        using var cursor = await collection.Indexes.ListAsync(cancellationToken: cancellationToken);
+        var docs = await cursor.ToListAsync(cancellationToken);
+        return RowsResult(docs, stopwatch);
+    }
+
+    private async Task<QueryResult> RunShellCollectionStats(ShellCollectionStats stats, Stopwatch stopwatch, CancellationToken cancellationToken)
+    {
+        var command = new BsonDocument("collStats", stats.Collection);
+        var doc = await Database().RunCommandAsync<BsonDocument>(
+            new BsonDocumentCommand<BsonDocument>(command),
+            cancellationToken: cancellationToken);
+        return RowsResult([doc], stopwatch);
+    }
+
+    private async Task<QueryResult> RunShellDatabaseStats(Stopwatch stopwatch, CancellationToken cancellationToken)
+    {
+        var doc = await Database().RunCommandAsync<BsonDocument>(
+            new BsonDocumentCommand<BsonDocument>(new BsonDocument("dbStats", 1)),
+            cancellationToken: cancellationToken);
+        return RowsResult([doc], stopwatch);
+    }
+
+    private async Task<QueryResult> RunShellGetCollectionNames(Stopwatch stopwatch, CancellationToken cancellationToken)
+    {
+        using var cursor = await Database().ListCollectionNamesAsync(cancellationToken: cancellationToken);
+        var values = await cursor.ToListAsync(cancellationToken);
+        var docs = values.Select(name => new BsonDocument("name", name)).ToList();
+        return RowsResult(docs, stopwatch, emptyColumns: ["name"]);
     }
 
     private QueryResult RunShellInsert(ShellInsertMany insert, Stopwatch stopwatch, CancellationToken cancellationToken)
@@ -902,16 +975,24 @@ internal sealed class MongoConnection : IDatabaseConnection
         };
     }
 
-    private static QueryResult RowsResult(List<BsonDocument> docs, Stopwatch stopwatch)
+    private static QueryResult RowsResult(
+        List<BsonDocument> docs,
+        Stopwatch stopwatch,
+        int? rowCap = null,
+        IReadOnlyList<string>? emptyColumns = null)
     {
-        var columns = InferColumns(docs);
-        var rows = docs.Select(doc => columns.Select(c => (string?)FormatCell(doc.GetValue(c, BsonNull.Value))).ToArray()).ToList();
+        var truncated = rowCap is { } cap && docs.Count > cap;
+        var visible = truncated ? docs.Take(rowCap!.Value).ToList() : docs;
+        var columns = visible.Count > 0 ? InferColumns(visible) : (emptyColumns ?? []);
+        var rows = visible.Select(doc => columns.Select(c => (string?)FormatCell(doc.GetValue(c, BsonNull.Value))).ToArray()).ToList();
         return new QueryResult
         {
             Columns = columns.Select(c => new QueryColumn { Name = c }).ToList(),
             Rows = rows,
-            Message = $"{rows.Count} rows",
+            Message = truncated ? $"{rows.Count} rows (truncated at {rowCap})" : $"{rows.Count} rows",
             Elapsed = stopwatch.Elapsed,
+            IsTruncated = truncated,
+            RowLimit = rowCap,
         };
     }
 
@@ -923,9 +1004,21 @@ internal sealed class MongoConnection : IDatabaseConnection
 // ============================================================================
 
 internal abstract record ShellCommand;
-internal sealed record ShellFind(string Collection, BsonDocument Filter) : ShellCommand;
-internal sealed record ShellFindOne(string Collection, BsonDocument Filter) : ShellCommand;
+internal sealed record ShellFind(
+    string Collection,
+    BsonDocument Filter,
+    BsonDocument? Projection = null,
+    BsonDocument? Sort = null,
+    int? Limit = null,
+    int? Skip = null) : ShellCommand;
+internal sealed record ShellFindOne(string Collection, BsonDocument Filter, BsonDocument? Projection = null) : ShellCommand;
 internal sealed record ShellCount(string Collection, BsonDocument Filter) : ShellCommand;
+internal sealed record ShellEstimatedCount(string Collection) : ShellCommand;
+internal sealed record ShellDistinct(string Collection, string Field, BsonDocument Filter) : ShellCommand;
+internal sealed record ShellGetIndexes(string Collection) : ShellCommand;
+internal sealed record ShellCollectionStats(string Collection) : ShellCommand;
+internal sealed record ShellDatabaseStats : ShellCommand;
+internal sealed record ShellGetCollectionNames : ShellCommand;
 internal sealed record ShellInsertMany(string Collection, List<BsonDocument> Documents) : ShellCommand;
 internal sealed record ShellUpdate(string Collection, BsonDocument Filter, BsonDocument Update) : ShellCommand;
 internal sealed record ShellDeleteBatch(string Collection, BsonDocument Filter) : ShellCommand;
@@ -933,45 +1026,72 @@ internal sealed record ShellDeleteBatch(string Collection, BsonDocument Filter) 
 internal static class MongoShellRunner
 {
     /// <summary>
-    /// Parses <c>db.collection.method(...)</c> for the common driver methods. Collection and method
-    /// come from the literal text; the argument (an extended-JSON document or array) is parsed with the
-    /// driver. Advanced mongosh (ObjectId('…') expressions, chained cursor methods) is not parsed;
-    /// those fall back to an honest "use the SQL surface" error.
+    /// Parses <c>db.collection.method(...)</c> and <c>db.method(...)</c> for the common driver
+    /// methods. Collection and method come from the literal text; arguments (extended-JSON documents,
+    /// arrays or quoted names) are parsed with the driver. Advanced mongosh expressions
+    /// (<c>ObjectId('…')</c>) are not parsed; a <c>find</c> may chain the safe cursor modifiers, and
+    /// anything else falls back to an honest "use the SQL surface" error.
     /// </summary>
     public static ShellCommand Parse(string statement)
     {
-        var text = statement.Trim().TrimEnd(';').Trim();
-        if (!text.StartsWith("db.", StringComparison.OrdinalIgnoreCase))
+        if (!statement.TrimStart().StartsWith("db.", StringComparison.OrdinalIgnoreCase))
         {
             throw new TranslationException("Mongosh passthrough must start with db.");
         }
 
-        var open = text.IndexOf('(');
-        if (open < 0 || !text.EndsWith(')'))
+        if (!MongoShellSyntax.TrySplitCalls(statement, out var head, out var body, out var suffixes))
         {
             throw new TranslationException("Mongosh passthrough needs a call like db.collection.method(…).");
         }
 
-        var head = text[3..open]; // collection.method, after "db."
         var lastDot = head.LastIndexOf('.');
-        if (lastDot <= 0)
+        if (lastDot < 0)
         {
-            throw new TranslationException("Mongosh passthrough must name a collection and a method (db.collection.method(…)).");
+            var databaseMethod = head.Trim().ToLowerInvariant();
+            if (suffixes.Count > 0)
+            {
+                throw new TranslationException("Mongosh cursor methods are only supported on find().");
+            }
+
+            return databaseMethod switch
+            {
+                "getcollectionnames" => new ShellGetCollectionNames(),
+                "stats" => new ShellDatabaseStats(),
+                _ => throw new TranslationException($"Mongosh method '{databaseMethod}()' is not supported — use the SQL surface."),
+            };
         }
 
         var collection = head[..lastDot].Trim();
         var method = head[(lastDot + 1)..].Trim().ToLowerInvariant();
-        var body = text[(open + 1)..^1].Trim();
+
+        if (suffixes.Count > 0 && method != "find")
+        {
+            throw new TranslationException("Mongosh cursor methods are only supported on find().");
+        }
 
         switch (method)
         {
             case "find":
-                return new ShellFind(collection, ArgDoc(body, 0));
+            {
+                var (filter, projection) = ParseFindArgs("find", body);
+                return ApplyFindSuffixes(new ShellFind(collection, filter, projection), suffixes);
+            }
             case "findone":
-                return new ShellFindOne(collection, ArgDoc(body, 0));
+            {
+                var (filter, projection) = ParseFindArgs("findOne", body);
+                return new ShellFindOne(collection, filter, projection);
+            }
             case "count":
             case "countdocuments":
                 return new ShellCount(collection, ArgDoc(body, 0));
+            case "estimateddocumentcount":
+                return new ShellEstimatedCount(collection);
+            case "distinct":
+                return ParseDistinct(collection, body);
+            case "getindexes":
+                return new ShellGetIndexes(collection);
+            case "stats":
+                return new ShellCollectionStats(collection);
             case "insertone":
             case "insertmany":
                 return new ShellInsertMany(collection, InsertDocs(body, method == "insertone"));
@@ -984,6 +1104,137 @@ internal static class MongoShellRunner
             default:
                 throw new TranslationException($"Mongosh method '{method}()' is not supported — use the SQL surface.");
         }
+    }
+
+    /// <summary>
+    /// The find options a shell <c>find</c> runs with. The row cap is the same one the SQL path
+    /// enforces, pushed to the server (plus the extra row used to detect truncation).
+    /// </summary>
+    public static FindOptions<BsonDocument> BuildFindOptions(ShellFind find, int rowCap)
+    {
+        // A user limit below the cap is honoured; one above it is clipped so the provider cap still
+        // holds. Zero means "no limit" in mongosh, so it falls back to the cap as well.
+        var fetch = find.Limit is { } limit && limit > 0
+            ? Math.Min(limit, rowCap + 1)
+            : rowCap + 1;
+        var options = new FindOptions<BsonDocument> { Limit = fetch };
+        if (find.Skip is { } skip)
+        {
+            options.Skip = skip;
+        }
+
+        if (find.Sort is not null)
+        {
+            options.Sort = new BsonDocumentSortDefinition<BsonDocument>(find.Sort);
+        }
+
+        ApplyProjection(options, find.Projection);
+        return options;
+    }
+
+    public static FindOptions<BsonDocument> BuildFindOneOptions(ShellFindOne find)
+    {
+        var options = new FindOptions<BsonDocument> { Limit = 1 };
+        ApplyProjection(options, find.Projection);
+        return options;
+    }
+
+    private static ShellFind ApplyFindSuffixes(ShellFind find, List<ShellSuffix> suffixes)
+    {
+        foreach (var suffix in suffixes)
+        {
+            switch (suffix.Method.ToLowerInvariant())
+            {
+                case "limit":
+                    find = find with { Limit = ParseCount("limit", suffix.Body) };
+                    break;
+                case "skip":
+                    find = find with { Skip = ParseCount("skip", suffix.Body) };
+                    break;
+                case "sort":
+                    find = find with { Sort = DocumentArg("sort", suffix.Body) };
+                    break;
+                case "project":
+                    find = find with { Projection = DocumentArg("project", suffix.Body) };
+                    break;
+                default:
+                    throw new TranslationException($"Mongosh cursor method '{suffix.Method}()' is not supported — use the SQL surface.");
+            }
+        }
+
+        return find;
+    }
+
+    private static int ParseCount(string method, string body)
+    {
+        if (!int.TryParse(body.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var value) || value < 0)
+        {
+            throw new TranslationException($"{method}() needs a non-negative integer.");
+        }
+
+        return value;
+    }
+
+    private static BsonDocument DocumentArg(string method, string body)
+    {
+        if (string.IsNullOrWhiteSpace(body))
+        {
+            throw new TranslationException($"{method}() needs a document.");
+        }
+
+        return BsonDocument.Parse(body);
+    }
+
+    private static void ApplyProjection(FindOptions<BsonDocument> options, BsonDocument? projection)
+    {
+        if (projection is not null)
+        {
+            options.Projection = new BsonDocumentProjectionDefinition<BsonDocument>(projection);
+        }
+    }
+
+    /// <summary><c>distinct(field, filter)</c>; the field is a quoted mongosh string.</summary>
+    private static ShellDistinct ParseDistinct(string collection, string body)
+    {
+        var args = SplitArgs(body);
+        if (args.Count == 0 || args.Count > 2)
+        {
+            throw new TranslationException("distinct takes (field, filter).");
+        }
+
+        return new ShellDistinct(
+            collection,
+            StringArg(args[0], "distinct"),
+            args.Count > 1 ? BsonDocument.Parse(args[1]) : new BsonDocument());
+    }
+
+    /// <summary>
+    /// <c>find(filter, projection)</c> and <c>findOne(filter, projection)</c>. Extra arguments are
+    /// refused rather than silently ignored: a caller that asked to project must not get every field.
+    /// </summary>
+    private static (BsonDocument Filter, BsonDocument? Projection) ParseFindArgs(string method, string body)
+    {
+        var args = SplitArgs(body);
+        if (args.Count > 2)
+        {
+            throw new TranslationException($"{method} takes (filter, projection).");
+        }
+
+        return (
+            args.Count > 0 ? BsonDocument.Parse(args[0]) : new BsonDocument(),
+            args.Count > 1 ? BsonDocument.Parse(args[1]) : null);
+    }
+
+    private static string StringArg(string token, string method)
+    {
+        var text = token.Trim();
+        if (text.Length < 2 || (text[0] != '"' && text[0] != '\'') || text[^1] != text[0])
+        {
+            throw new TranslationException($"{method}() needs a quoted field name.");
+        }
+
+        // The driver wants the literal field name, so drop the quotes and their escapes.
+        return text[1..^1].Replace("\\\"", "\"").Replace("\\'", "'").Replace("\\\\", "\\");
     }
 
     private static BsonDocument ArgDoc(string body, int index)
@@ -1032,7 +1283,10 @@ internal static class MongoShellRunner
         return new ShellUpdate(collection, BsonDocument.Parse(args[0]), BsonDocument.Parse(args[1]));
     }
 
-    /// <summary>Splits a positional argument list, shallow (no nesting-aware split needed for the common methods).</summary>
+    /// <summary>
+    /// Splits a positional argument list at top-level commas, respecting both quote styles and
+    /// bracket nesting. Commas inside a string or a document stay part of their argument.
+    /// </summary>
     private static List<string> SplitArgs(string body)
     {
         if (string.IsNullOrWhiteSpace(body))
@@ -1042,25 +1296,39 @@ internal static class MongoShellRunner
 
         var args = new List<string>();
         var depth = 0;
-        var inString = false;
+        char? quote = null;
         var start = 0;
 
         for (var i = 0; i < body.Length; i++)
         {
             var c = body[i];
-            if (c == '"' && (i == 0 || body[i - 1] != '\\'))
+            if (quote is { } q)
             {
-                inString = !inString;
+                if (c == '\\')
+                {
+                    i++;
+                }
+                else if (c == q)
+                {
+                    quote = null;
+                }
+
+                continue;
             }
-            else if (!inString && c is '[' or '{' or '(')
+
+            if (c is '"' or '\'')
+            {
+                quote = c;
+            }
+            else if (c is '[' or '{' or '(')
             {
                 depth++;
             }
-            else if (!inString && c is ']' or '}' or ')')
+            else if (c is ']' or '}' or ')')
             {
                 depth--;
             }
-            else if (!inString && c == ',' && depth == 0)
+            else if (c == ',' && depth == 0)
             {
                 args.Add(body[start..i].Trim());
                 start = i + 1;

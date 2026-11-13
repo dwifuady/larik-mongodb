@@ -60,13 +60,23 @@ After the release, add its URL and SHA-256 to the
 
 The provider implements `IReadOnlyStatementPolicy`, so a workspace exposed to an agent as **Read
 only** runs reads instead of refusing everything: a `SELECT` the translator compiles to a pipeline,
-a `USE`, or one mongosh call on the read allow-list (`find`, `findOne`, `aggregate`, `count`,
+a `USE`, or one mongosh call on the read allow-list (`find`, `findOne`, `count`,
 `countDocuments`, `estimatedDocumentCount`, `distinct`, `getIndexes`, `getCollectionNames`, `stats`).
+Each of those is implemented by the runner, so a gate-approved call executes. The gate also knows the
+level: `db.users.getIndexes()` and `db.getCollectionNames()` are valid, `db.getIndexes()` and
+`db.users.getCollectionNames()` are not.
 
 The gate is fail-closed. `INSERT` / `UPDATE` / `DELETE`, `insertOne` / `updateMany` /
-`deleteMany`, `runCommand`, chained calls and any batch mixing a read with something else are
-refused, and `aggregate` is refused when it carries a writing stage (`$out`, `$merge`). Write
-workspaces still go through the studio's approval dialog as usual.
+`deleteMany`, `runCommand`, unsafe chained calls and any batch mixing a read with something else
+are refused. `aggregate` is not on the allow-list — it can write through `$out`/`$merge`, and the
+passthrough runner does not execute it — so use the SQL surface for grouping. Write workspaces still
+go through the studio's approval dialog as usual.
+
+A mongosh `find` obeys the same row cap as `SELECT`, and `find(filter, projection)` /
+`findOne(filter, projection)` apply the projection instead of returning every field — so a large
+collection is not read whole. A `find` may also chain the cursor modifiers that only narrow a read
+(`.sort()`, `.skip()`, `.limit()`, `.project()`); any other chained method is refused. `SELECT …
+TOP n` remains the SQL way to ask for a specific row count.
 
 ## Contract
 

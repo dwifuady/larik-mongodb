@@ -1,3 +1,4 @@
+using System.Globalization;
 using Larik.Data;
 using MongoDB.Bson;
 
@@ -11,11 +12,11 @@ namespace Larik.Data.MongoDB;
 /// same splitter the editor and execution use, and a unit is a read only when it is a
 /// <c>SELECT</c> the translator compiles to a read pipeline (or a <c>USE</c> that only re-targets the
 /// session's database), or a mongosh call on the read allow-list whose arguments carry no writing
-/// pipeline stage.
+/// pipeline stage, optionally narrowed by the safe <c>find</c> cursor modifiers.
 /// <para>
-/// Fail-closed, deliberately: unparseable text, a chained call, an unknown method or a mixed batch is
-/// refused rather than executed. The mongosh side is an allow-list because the passthrough runner can
-/// write (insert/update/delete) and mongosh itself is a general-purpose shell.
+/// Fail-closed, deliberately: unparseable text, an unknown method, an unsafe chained call or a mixed
+/// batch is refused rather than executed. The mongosh side is an allow-list because the passthrough
+/// runner can write (insert/update/delete) and mongosh itself is a general-purpose shell.
 /// </para>
 /// </summary>
 internal sealed class MongoReadOnlyPolicy : IReadOnlyStatementPolicy
@@ -23,23 +24,40 @@ internal sealed class MongoReadOnlyPolicy : IReadOnlyStatementPolicy
     public static MongoReadOnlyPolicy Instance { get; } = new();
 
     /// <summary>
-    /// mongosh methods that only read, matching the reference studio's list so an agent's script
-    /// behaves the same on either. Being on this list does not mean the passthrough runner implements
-    /// the method: the gate answers "is this a read", and an unsupported form still fails at execution
-    /// with its own message.
+    /// Read methods the passthrough runner executes, split by the level they belong to. Keeping the
+    /// two sets separate means <c>db.getIndexes()</c> and <c>db.collection.getCollectionNames()</c>
+    /// are refused instead of passing the gate and failing at execution. <c>aggregate</c> is
+    /// deliberately absent: it can write through <c>$out</c>/<c>$merge</c>, and a text scan is not
+    /// enough to prove a parsed pipeline is read-only.
     /// </summary>
-    private static readonly HashSet<string> ReadMethods = new(StringComparer.OrdinalIgnoreCase)
+    private static readonly HashSet<string> CollectionReadMethods = new(StringComparer.OrdinalIgnoreCase)
     {
         "find",
         "findOne",
-        "aggregate",
         "count",
         "countDocuments",
         "estimatedDocumentCount",
         "distinct",
         "getIndexes",
+        "stats",
+    };
+
+    private static readonly HashSet<string> DatabaseReadMethods = new(StringComparer.OrdinalIgnoreCase)
+    {
         "getCollectionNames",
         "stats",
+    };
+
+    /// <summary>
+    /// Cursor modifiers that only narrow a <c>find</c>. Anything else chained after a call is not
+    /// provably a read: mongosh cursors have methods that execute arbitrary callbacks.
+    /// </summary>
+    private static readonly HashSet<string> ReadSuffixes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "limit",
+        "skip",
+        "sort",
+        "project",
     };
 
     /// <summary>
@@ -113,83 +131,57 @@ internal sealed class MongoReadOnlyPolicy : IReadOnlyStatementPolicy
     }
 
     /// <summary>
-    /// One <c>db.collection.method(...)</c> or <c>db.method(...)</c> call, no chain, on the read
-    /// allow-list, with arguments free of <c>$out</c>/<c>$merge</c>. Chained calls are refused because
-    /// the runner cannot execute them anyway and judging an arbitrary suffix as a read is guesswork.
+    /// One <c>db.collection.method(...)</c> or <c>db.method(...)</c> call on the read allow-list,
+    /// optionally followed by the cursor modifiers that only narrow a <c>find</c>
+    /// (<c>.limit</c>, <c>.skip</c>, <c>.sort</c>, <c>.project</c>). Arguments must be free of
+    /// <c>$out</c>/<c>$merge</c>. Any other chained method is refused: a cursor callback can write.
     /// </summary>
     private static bool IsReadShell(string statement)
     {
-        var text = statement.Trim().TrimEnd(';').Trim();
-        if (!text.StartsWith("db.", StringComparison.OrdinalIgnoreCase) || !text.EndsWith(')'))
-        {
-            return false;
-        }
-
-        var open = text.IndexOf('(');
-        if (open <= "db.".Length)
-        {
-            return false;
-        }
-
-        var close = MatchingParen(text, open);
-        if (close != text.Length - 1)
+        if (!MongoShellSyntax.TrySplitCalls(statement, out var head, out var baseBody, out var suffixes))
         {
             return false;
         }
 
         // db.collection.method(...) names the collection then the method; db.method(...) names only
         // the method (db.getCollectionNames(), db.stats()).
-        var head = text["db.".Length..open];
         var lastDot = head.LastIndexOf('.');
         var method = (lastDot < 0 ? head : head[(lastDot + 1)..]).Trim();
-        if (!ReadMethods.Contains(method))
+        var allowed = lastDot < 0 ? DatabaseReadMethods : CollectionReadMethods;
+        if (!allowed.Contains(method) || ContainsWriteStage(baseBody))
         {
             return false;
         }
 
-        return !ContainsWriteStage(text[(open + 1)..close]);
-    }
-
-    /// <summary>Index of the <c>)</c> closing <paramref name="open"/>, or -1 when the call is malformed.</summary>
-    private static int MatchingParen(string text, int open)
-    {
-        var depth = 0;
-        for (var index = open; index < text.Length; index++)
+        if (suffixes.Count == 0)
         {
-            var current = text[index];
-            if (current is '"' or '\'')
-            {
-                index = EndOfString(text, index);
-                if (index < 0)
-                {
-                    return -1;
-                }
+            return true;
+        }
 
-                continue;
+        // Cursor modifiers are only meaningful on a collection-level find(); the runner refuses them
+        // elsewhere too.
+        if (lastDot < 0 || !method.Equals("find", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        foreach (var suffix in suffixes)
+        {
+            if (!ReadSuffixes.Contains(suffix.Method) || ContainsWriteStage(suffix.Body))
+            {
+                return false;
             }
 
-            switch (current)
+            // limit/skip must be the non-negative integer the runner will parse; anything else is
+            // malformed, not a read we can stand behind.
+            if (IsCountSuffix(suffix.Method)
+                && (!int.TryParse(suffix.Body.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var count) || count < 0))
             {
-                case '(' or '[' or '{':
-                    depth++;
-                    break;
-                case ')' or ']' or '}':
-                    depth--;
-                    if (depth < 0)
-                    {
-                        return -1;
-                    }
-
-                    if (depth == 0)
-                    {
-                        return current == ')' ? index : -1;
-                    }
-
-                    break;
+                return false;
             }
         }
 
-        return -1;
+        return true;
     }
 
     /// <summary>
@@ -197,6 +189,12 @@ internal sealed class MongoReadOnlyPolicy : IReadOnlyStatementPolicy
     /// String contents are read so a quoted key is still found, but only a key counts: the same text
     /// used as a value (<c>{note: "$out"}</c>) is harmless, and skipping strings outright would hide
     /// <c>{"$out": "archive"}</c>.
+    /// <para>
+    /// This is a text heuristic for the allow-listed read methods, whose arguments never execute
+    /// pipeline stages. It is not sufficient for <c>aggregate</c> (a JSON escape such as
+    /// <c>\u0024out</c> parses to a writing stage), which is exactly why <c>aggregate</c> is not on
+    /// the allow-list.
+    /// </para>
     /// </summary>
     private static bool ContainsWriteStage(string arguments)
     {
@@ -206,7 +204,7 @@ internal sealed class MongoReadOnlyPolicy : IReadOnlyStatementPolicy
             var current = arguments[index];
             if (current is '"' or '\'')
             {
-                var close = EndOfString(arguments, index);
+                var close = MongoShellSyntax.EndOfString(arguments, index);
                 if (close < 0)
                 {
                     // Unterminated: refuse rather than guess where the argument ends.
@@ -245,32 +243,15 @@ internal sealed class MongoReadOnlyPolicy : IReadOnlyStatementPolicy
         return false;
     }
 
+    private static bool IsCountSuffix(string method) =>
+        method.Equals("limit", StringComparison.OrdinalIgnoreCase)
+        || method.Equals("skip", StringComparison.OrdinalIgnoreCase);
+
     private static bool IsWriteStage(string name) =>
         WriteStages.Contains(name, StringComparer.Ordinal);
 
     private static bool HasWriteStage(IEnumerable<BsonDocument> pipeline) =>
         pipeline.Any(stage => stage.Elements.Any(element => IsWriteStage(element.Name)));
-
-    /// <summary>Index of the quote closing the string starting at <paramref name="open"/>, or -1.</summary>
-    private static int EndOfString(string text, int open)
-    {
-        var quote = text[open];
-        for (var index = open + 1; index < text.Length; index++)
-        {
-            if (text[index] == '\\')
-            {
-                index++;
-                continue;
-            }
-
-            if (text[index] == quote)
-            {
-                return index;
-            }
-        }
-
-        return -1;
-    }
 
     private static char? NextNonSpace(string text, int index)
     {

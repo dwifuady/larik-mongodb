@@ -122,6 +122,31 @@ public sealed class TSqlMongoCompilerTests
     }
 
     [Fact]
+    public void Group_by_can_sort_by_a_select_alias()
+    {
+        AssertSelect(
+            "SELECT [city], COUNT(*) AS [n], MAX([age]) AS [oldest] FROM [users] GROUP BY [city] ORDER BY [n] DESC, [oldest]",
+            [
+                "{ \"$group\": { \"_id\": \"$city\", \"count\": { \"$sum\": 1 }, \"max\": { \"$max\": \"$age\" } } }",
+                "{ \"$sort\": { \"count\": -1, \"max\": 1 } }",
+                "{ \"$project\": { \"_id\": 0, \"city\": \"$_id\", \"n\": \"$count\", \"oldest\": \"$max\" } }",
+            ],
+            ["city", "n", "oldest"]);
+    }
+
+    [Fact]
+    public void Order_by_can_name_a_column_alias()
+    {
+        AssertSelect(
+            "SELECT [name] AS [who] FROM [users] ORDER BY [who]",
+            [
+                "{ \"$sort\": { \"name\": 1 } }",
+                "{ \"$project\": { \"_id\": 0, \"who\": \"$name\" } }",
+            ],
+            ["who"]);
+    }
+
+    [Fact]
     public void Whole_collection_aggregate()
     {
         AssertSelect(

@@ -1,7 +1,7 @@
 {
   "manifestVersion": 1,
   "id": "larik.mongodb",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "publisher": "Larik",
   "contract": ">=1.2 <2.0",
   "providerIds": ["mongodb"],
